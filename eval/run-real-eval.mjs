@@ -97,6 +97,12 @@ export async function runRealEvaluation(options) {
       return engine;
     };
 
+    // 中途快照（writeSummary）會用到後面階段的陣列，先宣告
+    const equalComputeResults = [];
+    const ppcWithExperienceResults = [];
+    const leaveOneOutResults = [];
+    const sharedExp = new ExperienceLibrary(path.join(tempRoot, 'stage2-shared-experience'));
+
     // 1. Base variance：每題 baseRuns 次
     const baseEngine = makeEngine('base', new ExperienceLibrary(path.join(tempRoot, 'exp-base')));
     const baseVarianceByTask = [];
@@ -118,7 +124,6 @@ export async function runRealEvaluation(options) {
     const heldoutVariance = calcStats(baseVarianceByTask.filter((t) => t.split === 'heldout').map((t) => t.stdDevCompositeScore));
 
     // 2. G1：同探針預算比較（best-of-k vs PPC 無 Compose vs 單步 PPC）
-    const equalComputeResults = [];
     for (const task of tasks) {
       const boRuns = [];
       let boTokens = 0;
@@ -154,9 +159,7 @@ export async function runRealEvaluation(options) {
     }
 
     // 3. G2：依序跑所有任務並累積共用經驗庫；heldout 再做 leave-one-out
-    const sharedExp = new ExperienceLibrary(path.join(tempRoot, 'stage2-shared-experience'));
     const s2 = makeEngine('stage2', sharedExp);
-    const ppcWithExperienceResults = [];
     for (let idx = 0; idx < tasks.length; idx++) {
       const task = tasks[idx];
       const store = new HarnessStateStore({ storageDir: path.join(tempRoot, `store-s2-${task.taskId}`), activeHarnessDir: path.join(tempRoot, `active-s2-${task.taskId}`) });
@@ -173,7 +176,6 @@ export async function runRealEvaluation(options) {
       writeSummary();
     }
     const heldoutTasks = tasks.filter((t) => t.split === 'heldout');
-    const leaveOneOutResults = [];
     for (const task of heldoutTasks) {
       const taskIdx = tasks.findIndex((t) => t.taskId === task.taskId);
       const priorTaskIds = tasks.slice(0, taskIdx).map((t) => t.taskId);

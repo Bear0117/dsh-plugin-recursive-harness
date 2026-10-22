@@ -1,4 +1,5 @@
 // Sidecar 狀態持久化：manifest.json、events.jsonl、內容定址 Harness 快照與中斷點恢復
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import {
@@ -10,6 +11,66 @@ import {
   loadHarnessFromDir,
   writeHarnessToDir,
 } from './harness-loader.js';
+
+const DEFAULT_STALE_AFTER_MS = 15 * 60 * 1000;
+const RENAME_MAX_ATTEMPTS = 5;
+const RENAME_RETRY_DELAY_MS = 20;
+
+/**
+ * 同步等待（零相依；用於 rename 重試間隔）
+ * @param {number} ms
+ */
+function sleepSync(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+/**
+ * 原子寫入 JSON：先寫入 `<file>.tmp-<pid>-<random>` 再 rename 覆蓋目標檔。
+ * Windows 上 rename 覆蓋既有檔案偶爾會 EPERM，最多重試 5 次、每次等 20ms。
+ * @param {string} filePath
+ * @param {any} data
+ */
+export function writeJsonAtomic(filePath, data) {
+  const tmpPath = `${filePath}.tmp-${process.pid}-${crypto.randomBytes(4).toString('hex')}`;
+  fs.writeFileSync(tmpPath, JSON.stringify(data, null, 2), 'utf8');
+  let lastError = null;
+  for (let attempt = 1; attempt <= RENAME_MAX_ATTEMPTS; attempt += 1) {
+    try {
+      fs.renameSync(tmpPath, filePath);
+      return;
+    } catch (err) {
+      lastError = err;
+      if (attempt < RENAME_MAX_ATTEMPTS && (err.code === 'EPERM' || err.code === 'EBUSY' || err.code === 'EACCES')) {
+        sleepSync(RENAME_RETRY_DELAY_MS);
+        continue;
+      }
+      break;
+    }
+  }
+  try {
+    fs.rmSync(tmpPath, { force: true });
+  } catch {
+    // 忽略暫存檔清理失敗
+  }
+  throw lastError;
+}
+
+/**
+ * 試探指定 pid 之行程是否仍存在（EPERM 視為存在；ESRCH 等視為不存在）
+ * @param {unknown} pid
+ * @returns {boolean}
+ */
+function isProcessAlive(pid) {
+  const n = Number(pid);
+  if (!Number.isInteger(n) || n <= 0) return false;
+  if (n === process.pid) return true;
+  try {
+    process.kill(n, 0);
+    return true;
+  } catch (err) {
+    return err?.code === 'EPERM';
+  }
+}
 
 export class HarnessStateStore {
   /**
@@ -41,7 +102,7 @@ export class HarnessStateStore {
         activeRunId: null,
         updatedAt: new Date().toISOString(),
       };
-      fs.writeFileSync(this.manifestPath, JSON.stringify(initialManifest, null, 2), 'utf8');
+      writeJsonAtomic(this.manifestPath, initialManifest);
     }
   }
 
@@ -74,7 +135,7 @@ export class HarnessStateStore {
       ...patch,
       updatedAt: new Date().toISOString(),
     };
-    fs.writeFileSync(this.manifestPath, JSON.stringify(next, null, 2), 'utf8');
+    writeJsonAtomic(this.manifestPath, next);
     return next;
   }
 
@@ -233,16 +294,19 @@ export class HarnessStateStore {
       }
     }
 
+    const now = new Date().toISOString();
     const record = {
       runId,
       state: existing?.state || EVOLUTION_STATES.OBSERVED,
-      createdAt: existing?.createdAt || new Date().toISOString(),
+      createdAt: existing?.createdAt || now,
       ...existing,
       ...patch,
-      updatedAt: new Date().toISOString(),
+      ownerPid: process.pid,
+      heartbeatAt: now,
+      updatedAt: now,
     };
 
-    fs.writeFileSync(filePath, JSON.stringify(record, null, 2), 'utf8');
+    writeJsonAtomic(filePath, record);
 
     const manifest = this.readManifest();
     if (TERMINAL_STATES.has(record.state)) {
@@ -253,6 +317,22 @@ export class HarnessStateStore {
       this.writeManifest({ activeRunId: runId });
     }
 
+    return record;
+  }
+
+  /**
+   * 僅更新中斷點之 heartbeatAt（不改 state、不走狀態機檢查），供執行中的行程定期心跳
+   * @param {string} runId
+   */
+  touchCheckpoint(runId) {
+    const filePath = path.join(this.checkpointsDir, `${runId}.json`);
+    const existing = this.getCheckpoint(runId);
+    if (!existing) return null;
+    const record = {
+      ...existing,
+      heartbeatAt: new Date().toISOString(),
+    };
+    writeJsonAtomic(filePath, record);
     return record;
   }
 
@@ -284,24 +364,44 @@ export class HarnessStateStore {
   }
 
   /**
-   * 協調器重啟恢復：掃描未終止之中斷點，回傳待續跑清單或將孤兒狀態標記為可安全恢復
-   * @param {{ markOrphansCancelled?: boolean }} [options]
+   * 協調器重啟恢復：掃描未終止之中斷點，回傳待續跑清單或將孤兒狀態標記為可安全恢復。
+   * 只有「ownerPid 行程已不存在」或「heartbeatAt 超過 staleAfterMs」的 run 才視為孤兒；
+   * 其餘（同機另一個 dsh 視窗正在跑的 run）保留，並在回傳值標記 skipped: true。
+   * @param {{ markOrphansCancelled?: boolean, staleAfterMs?: number, now?: number }} [options]
    */
   recoverInterruptedRuns(options = {}) {
     const checkpoints = this.listCheckpoints();
     const unfinished = checkpoints.filter((cp) => !TERMINAL_STATES.has(cp.state));
     const recovered = [];
+    const staleAfterMs = Number.isFinite(options.staleAfterMs)
+      ? Number(options.staleAfterMs)
+      : DEFAULT_STALE_AFTER_MS;
+    const nowMs = Number.isFinite(options.now) ? Number(options.now) : Date.now();
 
     for (const cp of unfinished) {
+      const ownerAlive = isProcessAlive(cp.ownerPid);
+      const heartbeatMs = Date.parse(cp.heartbeatAt || cp.updatedAt || '');
+      const stale = !Number.isFinite(heartbeatMs) || nowMs - heartbeatMs > staleAfterMs;
+      const orphan = !ownerAlive || stale;
+
+      if (!orphan) {
+        recovered.push({ ...cp, skipped: true });
+        continue;
+      }
+
       if (options.markOrphansCancelled) {
         const updated = this.saveCheckpoint(cp.runId, {
           state: EVOLUTION_STATES.CANCELLED,
-          recoveryNote: '行程重啟時自動清理未完成之演進狀態並釋放鎖定',
+          recoveryNote: ownerAlive
+            ? `心跳逾時（heartbeatAt 超過 ${staleAfterMs}ms）自動清理未完成之演進狀態並釋放鎖定`
+            : `擁有者行程（pid=${cp.ownerPid ?? 'unknown'}）已不存在，自動清理未完成之演進狀態並釋放鎖定`,
         });
         this.appendEvent({
           type: 'run/recovered-cancelled',
           runId: cp.runId,
           previousState: cp.state,
+          ownerPid: cp.ownerPid ?? null,
+          reason: ownerAlive ? 'stale-heartbeat' : 'owner-dead',
         });
         recovered.push(updated);
       } else {
@@ -334,7 +434,7 @@ export class HarnessStateStore {
       ...data,
       updatedAt: new Date().toISOString(),
     };
-    fs.writeFileSync(filePath, JSON.stringify(next, null, 2), 'utf8');
+    writeJsonAtomic(filePath, next);
     return next;
   }
 

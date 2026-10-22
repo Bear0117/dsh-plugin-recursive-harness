@@ -8,6 +8,37 @@ import {
 } from './types.js';
 import { validateCandidateProposal } from './security.js';
 
+const SAFE_SEGMENT_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+
+/**
+ * 判斷字串是否為安全之單一路徑片段（不含分隔符、不含 `..`、非 `.`、不以 `.` 開頭）
+ * @param {unknown} value
+ * @returns {boolean}
+ */
+export function isSafeSegment(value) {
+  if (typeof value !== 'string' || value.length === 0) return false;
+  if (value === '.' || value === '..') return false;
+  if (value.includes('/') || value.includes('\\') || value.includes('..')) return false;
+  if (path.basename(value) !== value) return false;
+  return SAFE_SEGMENT_PATTERN.test(value);
+}
+
+/**
+ * 斷言 skill 資料夾名／script 檔名為安全之單一路徑片段，否則丟出 HARNESS_UNSAFE_PATH
+ * @param {unknown} value
+ * @param {string} label
+ * @returns {string}
+ */
+export function assertSafeSegment(value, label) {
+  if (!isSafeSegment(value)) {
+    const err = new Error(`${label} 含不安全之路徑片段：${JSON.stringify(value)}`);
+    err.code = 'HARNESS_UNSAFE_PATH';
+    err.value = value;
+    throw err;
+  }
+  return value;
+}
+
 /**
  * 解析 SKILL.md 簡易 YAML frontmatter（name, description）與內文
  * @param {string} rawMarkdown
@@ -149,6 +180,10 @@ export function loadHarnessFromDir(harnessDir, options = {}) {
 
       const rawMd = fs.readFileSync(skillMdPath, 'utf8');
       const parsed = parseSkillMarkdown(rawMd, dirEntry.name);
+      // frontmatter name 未經驗證；不合法時退回使用資料夾名，避免後續寫回時成為路徑穿越來源
+      if (!isSafeSegment(parsed.name)) {
+        parsed.name = dirEntry.name;
+      }
       const scripts = {};
       const scriptsDir = path.join(skillDir, 'scripts');
       if (fs.existsSync(scriptsDir)) {
@@ -257,7 +292,7 @@ export function writeHarnessToDir(harness, targetDir, options = {}) {
   fs.mkdirSync(skillsRoot, { recursive: true });
 
   for (const skill of harness.skills ?? []) {
-    const folder = skill.folderName || skill.name;
+    const folder = assertSafeSegment(skill.folderName || skill.name, 'skill folderName/name');
     const skillDir = path.join(skillsRoot, folder);
     fs.mkdirSync(skillDir, { recursive: true });
     fs.writeFileSync(path.join(skillDir, 'SKILL.md'), `${String(skill.content ?? '').trim()}\n`, 'utf8');
@@ -266,6 +301,7 @@ export function writeHarnessToDir(harness, targetDir, options = {}) {
       const scriptsDir = path.join(skillDir, 'scripts');
       fs.mkdirSync(scriptsDir, { recursive: true });
       for (const [scriptName, scriptContent] of Object.entries(skill.scripts)) {
+        assertSafeSegment(scriptName, `skill "${folder}" script 檔名`);
         fs.writeFileSync(path.join(scriptsDir, scriptName), String(scriptContent), 'utf8');
       }
     }

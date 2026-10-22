@@ -130,8 +130,9 @@ export function parseHeadlessJsonStream(rawInput, meta = {}) {
           usage.stepsWithUsage += 1;
         }
         if (ev.phase === 'turn_end' && ev.reason) {
-          turnInfo.reason = ev.reason;
-          terminationReason = ev.reason;
+          const reason = typeof ev.reason === 'object' ? String(ev.reason.kind ?? 'completed') : String(ev.reason);
+          turnInfo.reason = reason;
+          terminationReason = reason;
         }
         break;
       }

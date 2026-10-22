@@ -1,4 +1,5 @@
 // 反思器（Reflector）與 Git 友善之跨任務經驗庫（Experience Library）
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { writeHarnessToDir, loadHarnessFromDir } from './harness-loader.js';
@@ -125,7 +126,11 @@ export class ExperienceLibrary {
       }
     }
 
-    return result.sort((a, b) => (a.taskSequenceIndex ?? 0) - (b.taskSequenceIndex ?? 0));
+    return result.sort(
+      (a, b) =>
+        (a.taskSequenceIndex ?? 0) - (b.taskSequenceIndex ?? 0) ||
+        String(a.createdAt ?? '').localeCompare(String(b.createdAt ?? '')),
+    );
   }
 
   /**
@@ -216,9 +221,21 @@ export class ExperienceLibrary {
       }
     }
 
-    const entryId =
+    // 以時間戳 + sourceEventId 雜湊產生條目編號（避免使用者刪除條目後 count+1 撞到既有 ID 而靜默覆蓋）
+    const domainSegment = String(rawEntry.domain || 'general').replace(/[^a-z0-9-]/gi, '') || 'general';
+    const eventSeed = rawEntry.sourceEventId
+      ? String(rawEntry.sourceEventId)
+      : crypto.randomBytes(8).toString('hex');
+    const eventHash = crypto.createHash('sha1').update(eventSeed, 'utf8').digest('hex').slice(0, 6);
+    const baseEntryId =
       rawEntry.entryId ||
-      `exp-${String(allEntries.length + 1).padStart(3, '0')}-${String(rawEntry.domain || 'general').replace(/[^a-z0-9-]/gi, '')}`;
+      `exp-${Date.now().toString(36)}-${eventHash}-${domainSegment}`;
+
+    // 寫入前確認目錄不存在；若已存在則加序號
+    let entryId = baseEntryId;
+    for (let seq = 2; fs.existsSync(path.join(this.experienceDir, entryId)); seq += 1) {
+      entryId = `${baseEntryId}-${seq}`;
+    }
 
     const entryDir = path.join(this.experienceDir, entryId);
     fs.mkdirSync(entryDir, { recursive: true });

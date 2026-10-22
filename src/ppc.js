@@ -1,6 +1,7 @@
 // Propose → Probe → Compose (PPC) 核心協調器、三層證據比較器与等算力評測支援
 import {
   EVOLUTION_STATES,
+  TERMINAL_STATES,
 } from './types.js';
 import {
   computeHarnessHash,
@@ -450,7 +451,9 @@ export class RecursiveHarnessCoordinator {
    *   maxTokensPerIteration?: number,
    *   maxWallTimeMs?: number,
    *   lockedSurfaces?: string[],
-   *   protectedPatterns?: string[]
+   *   protectedPatterns?: string[],
+   *   judgeFn?: (a: any, b: any, task: any) => Promise<{ winner: 'a'|'b'|'tie', reason: string }>,
+   *   logger?: (line: string) => void
    * }} deps
    */
   constructor(deps) {
@@ -465,8 +468,13 @@ export class RecursiveHarnessCoordinator {
     this.maxWallTimeMs = deps.maxWallTimeMs ?? 300000;
     this.lockedSurfaces = deps.lockedSurfaces;
     this.protectedPatterns = deps.protectedPatterns || [];
+    /** 模型裁判：(a, b, task) => { winner, reason }，只在兩個候選都通過客觀檢查且分數接近時使用 */
+    this.judgeFn = deps.judgeFn || null;
+    this.log = deps.logger || (() => {});
     /** @type {Set<string>} */
     this.cancelledRuns = new Set();
+    /** @type {Map<string, Set<string>>} runId -> 進行中的 probeRunId */
+    this.activeProbes = new Map();
   }
 
   /**
@@ -475,19 +483,39 @@ export class RecursiveHarnessCoordinator {
    */
   async cancelRun(runId) {
     this.cancelledRuns.add(runId);
-    const cp = this.store.getCheckpoint(runId);
-    if (cp && cp.activeProbeRunIds) {
-      for (const pId of cp.activeProbeRunIds) {
+    const probes = this.activeProbes.get(runId);
+    if (probes) {
+      for (const pId of Array.from(probes)) {
         await this.probeRunner.cancel(pId);
       }
     }
-    if (cp) {
+    const cp = this.store.getCheckpoint(runId);
+    if (cp && !TERMINAL_STATES.has(cp.state)) {
       this.store.saveCheckpoint(runId, {
         state: EVOLUTION_STATES.CANCELLED,
       });
     }
-    await this.probeRunner.cleanupAll();
     return true;
+  }
+
+  /**
+   * 跑一次探針並登記在 activeProbes，讓 cancelRun 能砍到正在跑的子行程
+   */
+  async _probe(runId, task, harness, probeRunId) {
+    if (!this.activeProbes.has(runId)) this.activeProbes.set(runId, new Set());
+    this.activeProbes.get(runId).add(probeRunId);
+    try {
+      return await this.probeRunner.run(task, harness, { runId: probeRunId, autoCleanup: true });
+    } finally {
+      this.activeProbes.get(runId)?.delete(probeRunId);
+      if (typeof this.store.touchCheckpoint === 'function') {
+        try {
+          this.store.touchCheckpoint(runId);
+        } catch {
+          // 心跳失敗不影響流程
+        }
+      }
+    }
   }
 
   /**
@@ -563,10 +591,7 @@ export class RecursiveHarnessCoordinator {
     const referenceEvaluations = [];
     for (let i = 0; i < referenceRunsCount; i++) {
       checkBudgetAndCancel();
-      const rec = await this.probeRunner.run(task, currentHarness, {
-        runId: `${runId}-ref-${i + 1}`,
-        autoCleanup: true,
-      });
+      const rec = await this._probe(runId, task, currentHarness, `${runId}-ref-${i + 1}`);
       totalProbesExecuted += 1;
       totalTokensUsed += rec.usage?.totalTokens || 0;
       referenceRecords.push(rec);
@@ -643,10 +668,7 @@ export class RecursiveHarnessCoordinator {
         validProposals.map(async (prop, pIdx) => {
           checkBudgetAndCancel();
           const probeRunId = `${runId}-step${stepIdx + 1}-cand${pIdx + 1}`;
-          const execRec = await this.probeRunner.run(task, prop.harnessVersion, {
-            runId: probeRunId,
-            autoCleanup: true,
-          });
+          const execRec = await this._probe(runId, task, prop.harnessVersion, probeRunId);
           totalProbesExecuted += 1;
           totalTokensUsed += execRec.usage?.totalTokens || 0;
           const evalRes = this.comparator.evaluateRecord(execRec, task);
@@ -668,6 +690,7 @@ export class RecursiveHarnessCoordinator {
       );
 
       // 4. Compared 狀態：篩選優於基準之勝出候選
+      checkBudgetAndCancel();
       if (stepIdx === 0) {
         this.store.saveCheckpoint(runId, { state: EVOLUTION_STATES.COMPARED });
       }
@@ -675,6 +698,24 @@ export class RecursiveHarnessCoordinator {
       const winners = probeResults
         .filter((r) => r.isBetter && r.passedObjective)
         .sort((a, b) => b.evaluation.compositeScore - a.evaluation.compositeScore);
+
+      // 第 3 層：模型裁判。只在前兩名都通過客觀檢查且綜合分數差距小於 0.05 時介入，絕不推翻客觀檢查
+      let judgeVerdict = null;
+      if (typeof this.judgeFn === 'function' && winners.length >= 2) {
+        const [first, second] = winners;
+        if (Math.abs(first.evaluation.compositeScore - second.evaluation.compositeScore) < 0.05) {
+          try {
+            const verdict = await this.judgeFn(first.executionRecord, second.executionRecord, task);
+            judgeVerdict = { a: first.proposalId, b: second.proposalId, ...verdict };
+            if (verdict.winner === 'b') {
+              winners[0] = second;
+              winners[1] = first;
+            }
+          } catch (err) {
+            this.log(`judge failed: ${err.message}`);
+          }
+        }
+      }
 
       // 供 Compose 使用之正向候選：通過客觀檢查之勝出者，或（當基準尚未完全通過時）在部分客觀指標/綜合分數上有淨提升之互補候選
       const composableCandidates = probeResults
@@ -697,14 +738,7 @@ export class RecursiveHarnessCoordinator {
         }
         const composed = this.composer.compose(currentHarness, composableCandidates);
         checkBudgetAndCancel();
-        const composeVerifyRec = await this.probeRunner.run(
-          task,
-          composed.composedHarness,
-          {
-            runId: `${runId}-step${stepIdx + 1}-compose-verify`,
-            autoCleanup: true,
-          },
-        );
+        const composeVerifyRec = await this._probe(runId, task, composed.composedHarness, `${runId}-step${stepIdx + 1}-compose-verify`);
         totalProbesExecuted += 1;
         totalTokensUsed += composeVerifyRec.usage?.totalTokens || 0;
         const composeEval = this.comparator.evaluateRecord(composeVerifyRec, task);
@@ -736,10 +770,7 @@ export class RecursiveHarnessCoordinator {
         // 單一勝出候選或停用 Compose 時，執行一次重跑確認（Holdout Confirmation Run）
         chosenHarness = winners[0].proposal.harnessVersion;
         checkBudgetAndCancel();
-        const confirmRec = await this.probeRunner.run(task, chosenHarness, {
-          runId: `${runId}-step${stepIdx + 1}-confirm`,
-          autoCleanup: true,
-        });
+        const confirmRec = await this._probe(runId, task, chosenHarness, `${runId}-step${stepIdx + 1}-confirm`);
         totalProbesExecuted += 1;
         totalTokensUsed += confirmRec.usage?.totalTokens || 0;
         const confirmEval = this.comparator.evaluateRecord(confirmRec, task);
@@ -757,6 +788,7 @@ export class RecursiveHarnessCoordinator {
         adoptedInStep: Boolean(chosenHarness && chosenEvaluation?.passedObjective),
         chosenVersionId: chosenHarness?.versionId || currentHarness.versionId,
         composedSummary,
+        judgeVerdict,
       });
 
       if (chosenHarness && chosenEvaluation?.passedObjective) {
@@ -793,10 +825,7 @@ export class RecursiveHarnessCoordinator {
         });
       }
       // 在最終採用之 Harness 上取最後驗證分數
-      const verifyRec = await this.probeRunner.run(task, currentHarness, {
-        runId: `${runId}-final-eval`,
-        autoCleanup: true,
-      });
+      const verifyRec = await this._probe(runId, task, currentHarness, `${runId}-final-eval`);
       totalProbesExecuted += 1;
       totalTokensUsed += verifyRec.usage?.totalTokens || 0;
       finalEvaluation = this.comparator.evaluateRecord(verifyRec, task);
@@ -838,6 +867,8 @@ export class RecursiveHarnessCoordinator {
         });
       }
     }
+
+    this.activeProbes.delete(runId);
 
     return {
       runId,

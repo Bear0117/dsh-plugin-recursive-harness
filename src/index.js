@@ -13,7 +13,9 @@ import {
 import { HarnessStateStore } from './store.js';
 import { ExperienceLibrary, Reflector } from './experience.js';
 import { ProbeRunner } from './probe-runner.js';
-import { RecursiveHarnessCoordinator } from './ppc.js';
+import { RecursiveHarnessCoordinator, Proposer } from './ppc.js';
+import { LlmProposer } from './llm-proposer.js';
+import { loadTask, listBuiltinTaskIds } from './tasks.js';
 import { RuntimeStagnationDetector } from './stagnation.js';
 
 export const name = 'dsh-plugin-recursive-harness';
@@ -41,6 +43,7 @@ export class RecursiveHarnessService {
     this.probeRunner = deps.probeRunner;
     this.coordinator = deps.coordinator;
     this.onActiveHarnessChanged = deps.onActiveHarnessChanged || null;
+    this.log = deps.logger || (() => {});
   }
 
   /**
@@ -89,7 +92,7 @@ export class RecursiveHarnessService {
       reason: 'baseline-before-start',
     });
 
-    const result = await this.coordinator.runPpcLoop(task, initialHarness, options);
+    const result = await this.coordinator.runPpcLoop(task, initialHarness, { runId: options.runId, ...options });
     if (result.adopted && typeof this.onActiveHarnessChanged === 'function') {
       this.onActiveHarnessChanged(result.finalHarness);
     }
@@ -161,7 +164,7 @@ export function createHarnessCommand(service) {
     name: 'harness',
     description: '檢視或控制雙層遞迴 Harness（inspect | start | status | cancel | rollback | listExperience）',
     input: {
-      hint: 'inspect | status [runId] | cancel [runId] | rollback [versionId] | listExperience',
+      hint: 'inspect | start <taskId|task.mjs> | status [runId] | cancel [runId] | rollback [versionId] | listExperience',
     },
     handler: async ({ rawInput = '' } = {}) => {
       const tokens = String(rawInput || '')
@@ -173,6 +176,26 @@ export function createHarnessCommand(service) {
 
       try {
         switch (sub) {
+          case 'start': {
+            if (!arg) {
+              return {
+                kind: 'error',
+                text: `請指定任務：\`/harness start <taskId|task.mjs>\`。內建任務：${listBuiltinTaskIds().join(', ')}`,
+              };
+            }
+            const task = await loadTask(arg);
+            const runId = `ppc-${task.taskId}-${Date.now()}`;
+            // 演進要跑好幾個 headless 子行程（幾分鐘），不佔住指令；用 /harness status 看進度
+            service
+              .start(task, { runId })
+              .then((res) => service.log?.(`run ${runId} finished: adopted=${res.adopted} probes=${res.totalProbesExecuted} tokens=${res.totalTokensUsed}`))
+              .catch((err) => service.log?.(`run ${runId} failed: ${err.message}`));
+            return {
+              kind: 'success',
+              text: `已在背景啟動演進：\`${runId}\`（任務 \`${task.taskId}\`）。用 \`/harness status ${runId}\` 查進度、\`/harness cancel ${runId}\` 取消。`,
+            };
+          }
+
           case 'inspect': {
             const info = service.inspect();
             const skillNames = info.skills.map((s) => s.name).join(', ') || '無';
@@ -234,7 +257,7 @@ export function createHarnessCommand(service) {
           default:
             return {
               kind: 'error',
-              text: `未知的子指令：\`${sub}\`。支援子指令：\`inspect | status | cancel | rollback | listExperience\``,
+              text: `未知的子指令：\`${sub}\`。支援子指令：\`inspect | start | status | cancel | rollback | listExperience\``,
             };
         }
       } catch (err) {
@@ -245,6 +268,61 @@ export function createHarnessCommand(service) {
       }
     },
   };
+}
+
+/**
+ * 依設定組出探針執行器、提案器（模板或 LLM）、裁判與協調器（插件與 CLI 共用）
+ * @param {ReturnType<typeof normalizeConfig>} config
+ * @param {{ store: HarnessStateStore, experienceLibrary: ExperienceLibrary, reflector: Reflector, executor?: any, logger?: (line: string) => void }} deps
+ */
+export function buildEngine(config, deps) {
+  const log = deps.logger || (() => {});
+  const probeRunner = new ProbeRunner({
+    maxConcurrency: config.maxConcurrency,
+    maxWallTimeMs: config.probeTimeoutMs ?? config.maxWallTimeMs,
+    timeWindowPolicy: config.timeWindowPolicy,
+    lockedSurfaces: config.lockedSurfaces,
+    protectedPatterns: config.protectedPatterns,
+    blockedTools: config.probe?.blockedTools,
+    preApprovedTools: config.preApprovedTools,
+    templateDshHome: config.probe?.templateDshHome,
+    templateProfile: config.probe?.templateProfile,
+    probeProvider: config.probe?.provider,
+    probeModel: config.probe?.model,
+    dshCliEntry: config.probe?.dshCliEntry ?? config.dshCliEntry,
+    executor: deps.executor || null,
+    logger: log,
+  });
+
+  let proposer;
+  let judgeFn = null;
+  if (config.proposer.engine === 'llm') {
+    const llm = new LlmProposer({
+      settings: config.proposer,
+      experienceLibrary: deps.experienceLibrary,
+      maxCandidateChars: config.proposer.maxCandidateChars,
+      logger: log,
+    });
+    proposer = llm;
+    if (config.proposer.judge) judgeFn = (a, b, task) => llm.judge(a, b, task);
+  } else {
+    proposer = new Proposer({ experienceLibrary: deps.experienceLibrary });
+  }
+
+  const coordinator = new RecursiveHarnessCoordinator({
+    probeRunner,
+    store: deps.store,
+    experienceLibrary: deps.experienceLibrary,
+    reflector: deps.reflector,
+    proposer,
+    judgeFn,
+    maxTokensPerIteration: config.maxTokensPerIteration,
+    maxWallTimeMs: config.maxWallTimeMs,
+    lockedSurfaces: config.lockedSurfaces,
+    protectedPatterns: config.protectedPatterns,
+    logger: log,
+  });
+  return { probeRunner, proposer, judgeFn, coordinator };
 }
 
 /**
@@ -324,26 +402,16 @@ export function apply(ctx, rawConfig = {}) {
 
   const experienceLibrary = new ExperienceLibrary(config.experienceDir);
   const reflector = new Reflector(experienceLibrary);
-  const probeRunner = new ProbeRunner({
-    maxConcurrency: config.maxConcurrency,
-    maxWallTimeMs: config.maxWallTimeMs,
-    timeWindowPolicy: config.timeWindowPolicy,
-    lockedSurfaces: config.lockedSurfaces,
-    protectedPatterns: config.protectedPatterns,
-    preApprovedTools: config.preApprovedTools,
-    dshCliEntry: config.dshCliEntry,
-  });
+  const log = (line) => console.error(`[recursive-harness] ${line}`);
+  try {
+    const swept = ProbeRunner.sweepStaleTempDirs();
+    if (swept > 0) log(`removed ${swept} stale probe temp dir(s)`);
+  } catch {
+    // 清掃失敗不影響啟動
+  }
 
-  const coordinator = new RecursiveHarnessCoordinator({
-    probeRunner,
-    store,
-    experienceLibrary,
-    reflector,
-    maxTokensPerIteration: config.maxTokensPerIteration,
-    maxWallTimeMs: config.maxWallTimeMs,
-    lockedSurfaces: config.lockedSurfaces,
-    protectedPatterns: config.protectedPatterns,
-  });
+  const { probeRunner, coordinator } = buildEngine(config, { store, experienceLibrary, reflector, logger: log });
+  log(`ready: mode=full, proposer=${config.proposer.engine}${config.proposer.engine === 'llm' ? ` (${config.proposer.model || 'model not set'})` : ''}, probe template=${config.probe.templateProfile}`);
 
   const service = new RecursiveHarnessService({
     config,
@@ -352,6 +420,7 @@ export function apply(ctx, rawConfig = {}) {
     probeRunner,
     coordinator,
     onActiveHarnessChanged: refreshGlobalHarness,
+    logger: log,
   });
 
   // 暴露 ctx.recursiveHarness 服務（相容於真實 Cordis 4 ctx.provide(name, value) 與測試 mock）

@@ -146,16 +146,119 @@ test('3. 狀態機合法轉換、快照回退（Rollback）與中斷點重啟恢
     assert.equal(rolledBack.versionId, v1.versionId);
     assert.equal(loadHarnessFromDir(activeDir).versionId, v1.versionId);
 
+    // 路徑穿越：skill 名稱／script 檔名不是單一安全片段時必須被拒絕（HARNESS_UNSAFE_PATH）
+    for (const badName of ['../evil', '..\\evil', 'a/b', '.hidden', '..', 'x'.repeat(65)]) {
+      assert.throws(
+        () =>
+          writeHarnessToDir(
+            { components: v1.components, skills: [{ name: badName, content: '# bad' }] },
+            path.join(tmp, 'bad-skill'),
+            { validateSecurity: false },
+          ),
+        (err) => err.code === 'HARNESS_UNSAFE_PATH',
+        `skill 名稱 ${JSON.stringify(badName)} 應被拒絕`,
+      );
+    }
+    assert.throws(
+      () =>
+        writeHarnessToDir(
+          {
+            components: v1.components,
+            skills: [{ name: 'ok-skill', content: '# ok', scripts: { '../../escape.js': 'x' } }],
+          },
+          path.join(tmp, 'bad-script'),
+          { validateSecurity: false },
+        ),
+      (err) => err.code === 'HARNESS_UNSAFE_PATH',
+    );
+    assert.equal(fs.existsSync(path.join(tmp, 'bad-skill', 'evil')), false);
+    assert.equal(fs.existsSync(path.join(tmp, 'bad-script', 'skills', 'escape.js')), false);
+    // 合法名稱（script 檔名允許 `.`）仍可寫入；frontmatter name 不合法時退回資料夾名
+    const okDir = path.join(tmp, 'ok-skill-harness');
+    writeHarnessToDir(
+      {
+        components: v1.components,
+        skills: [
+          {
+            name: 'ok.skill_v1',
+            content: '---\nname: ../../traversal\ndescription: 測試\n---\n# body',
+            scripts: { 'run.test.mjs': 'console.log(1)' },
+          },
+        ],
+      },
+      okDir,
+      { validateSecurity: false },
+    );
+    const okLoaded = loadHarnessFromDir(okDir, { validateSecurity: false });
+    assert.equal(okLoaded.skills.length, 1);
+    assert.equal(okLoaded.skills[0].name, 'ok.skill_v1');
+    assert.equal(okLoaded.skills[0].folderName, 'ok.skill_v1');
+    assert.deepEqual(Object.keys(okLoaded.skills[0].scripts), ['run.test.mjs']);
+
     // 測試中斷點恢復：模擬行程在 Probing 狀態中斷後重啟
     store.saveCheckpoint('run-interrupted-1', { state: EVOLUTION_STATES.OBSERVED });
     store.saveCheckpoint('run-interrupted-1', { state: EVOLUTION_STATES.PROPOSED });
-    store.saveCheckpoint('run-interrupted-1', { state: EVOLUTION_STATES.PROBING });
+    const probing = store.saveCheckpoint('run-interrupted-1', { state: EVOLUTION_STATES.PROBING });
 
-    const recovered = store.recoverInterruptedRuns({ markOrphansCancelled: true });
-    assert.equal(recovered.length, 1);
-    assert.equal(recovered[0].runId, 'run-interrupted-1');
-    assert.equal(recovered[0].state, EVOLUTION_STATES.CANCELLED);
+    // 原子寫入：檔案內容與回傳值一致、記錄 ownerPid／heartbeatAt、且無殘留 .tmp 檔
+    const cpPath = path.join(storageDir, 'checkpoints', 'run-interrupted-1.json');
+    assert.deepEqual(JSON.parse(fs.readFileSync(cpPath, 'utf8')), probing);
+    assert.equal(probing.ownerPid, process.pid);
+    assert.ok(Number.isFinite(Date.parse(probing.heartbeatAt)));
+    assert.deepEqual(JSON.parse(fs.readFileSync(path.join(storageDir, 'manifest.json'), 'utf8')).activeRunId, 'run-interrupted-1');
+    const sidecar = store.saveSessionSidecar('sess-atomic', { harnessVersionId: v1.versionId });
+    assert.deepEqual(store.getSessionSidecar('sess-atomic'), sidecar);
+    for (const dir of [storageDir, path.join(storageDir, 'checkpoints'), path.join(storageDir, 'sessions')]) {
+      assert.deepEqual(fs.readdirSync(dir).filter((f) => f.includes('.tmp-')), [], `${dir} 不應殘留暫存檔`);
+    }
+
+    // touchCheckpoint 只更新 heartbeatAt，不改 state
+    const touched = store.touchCheckpoint('run-interrupted-1');
+    assert.equal(touched.state, EVOLUTION_STATES.PROBING);
+    assert.ok(Date.parse(touched.heartbeatAt) >= Date.parse(probing.heartbeatAt));
+    assert.equal(store.touchCheckpoint('run-not-exist'), null);
+
+    // 第二個「行程」：ownerPid 已不存在（999999）-> 必須被標成 Cancelled
+    store.saveCheckpoint('run-dead-owner', { state: EVOLUTION_STATES.OBSERVED });
+    const deadPath = path.join(storageDir, 'checkpoints', 'run-dead-owner.json');
+    fs.writeFileSync(
+      deadPath,
+      JSON.stringify({ ...JSON.parse(fs.readFileSync(deadPath, 'utf8')), ownerPid: 999999 }, null, 2),
+      'utf8',
+    );
+    // 第三個：ownerPid 是本行程但心跳已超過 staleAfterMs -> 也必須被標成 Cancelled
+    store.saveCheckpoint('run-stale-heartbeat', { state: EVOLUTION_STATES.OBSERVED });
+    const stalePath = path.join(storageDir, 'checkpoints', 'run-stale-heartbeat.json');
+    fs.writeFileSync(
+      stalePath,
+      JSON.stringify(
+        {
+          ...JSON.parse(fs.readFileSync(stalePath, 'utf8')),
+          heartbeatAt: new Date(Date.now() - 60 * 60 * 1000).toISOString(),
+        },
+        null,
+        2,
+      ),
+      'utf8',
+    );
+
+    const recovered = store.recoverInterruptedRuns({ markOrphansCancelled: true, staleAfterMs: 15 * 60 * 1000 });
+    assert.equal(recovered.length, 3);
+    const byId = Object.fromEntries(recovered.map((r) => [r.runId, r]));
+    // 本行程、心跳很新的 run 不可被砍：保留並標記 skipped
+    assert.equal(byId['run-interrupted-1'].skipped, true);
+    assert.equal(byId['run-interrupted-1'].state, EVOLUTION_STATES.PROBING);
+    assert.equal(store.getCheckpoint('run-interrupted-1').state, EVOLUTION_STATES.PROBING);
+    assert.equal(byId['run-dead-owner'].state, EVOLUTION_STATES.CANCELLED);
+    assert.equal(byId['run-dead-owner'].skipped, undefined);
+    assert.equal(byId['run-stale-heartbeat'].state, EVOLUTION_STATES.CANCELLED);
+    assert.equal(store.getCheckpoint('run-dead-owner').state, EVOLUTION_STATES.CANCELLED);
+    assert.equal(store.getCheckpoint('run-stale-heartbeat').state, EVOLUTION_STATES.CANCELLED);
+
+    // 本行程的 run 結束後，manifest.activeRunId 才釋放
+    store.saveCheckpoint('run-interrupted-1', { state: EVOLUTION_STATES.CANCELLED });
     assert.equal(store.readManifest().activeRunId, null);
+    assert.equal(store.recoverInterruptedRuns({ markOrphansCancelled: true }).length, 0);
   } finally {
     fs.rmSync(tmp, { recursive: true, force: true });
   }
@@ -405,6 +508,46 @@ test('7. 跨任務經驗庫：時間序快照、冪等去重（sourceEventId）�
     const indexMd = fs.readFileSync(path.join(tmp, 'INDEX.md'), 'utf8');
     assert.ok(indexMd.includes(e1.entryId));
     assert.ok(indexMd.includes('retracted'));
+
+    // entryId 不重複：使用者刪掉 e2 後新增條目，不得撞到既有 ID 而覆蓋 e1 或 e2 的舊路徑
+    assert.notEqual(e1.entryId, e2.entryId);
+    fs.rmSync(path.join(tmp, e2.entryId), { recursive: true, force: true });
+    const e3 = lib.recordExperience({
+      title: '第三筆經驗',
+      summary: '刪除後新增',
+      domain: 'general',
+      sourceEventId: 'evt-003',
+      taskSequenceIndex: 3,
+    });
+    const e4 = lib.recordExperience({
+      title: '第四筆經驗',
+      summary: '同一毫秒內新增亦不得撞 ID',
+      domain: 'general',
+      sourceEventId: 'evt-004',
+      taskSequenceIndex: 4,
+    });
+    const ids = [e1.entryId, e2.entryId, e3.entryId, e4.entryId];
+    assert.equal(new Set(ids).size, ids.length);
+    assert.equal(fs.existsSync(path.join(tmp, e1.entryId, 'entry.meta.json')), true);
+    assert.equal(JSON.parse(fs.readFileSync(path.join(tmp, e1.entryId, 'entry.meta.json'), 'utf8')).sourceEventId, 'evt-001');
+    assert.match(e3.entryId, /^exp-[0-9a-z]+-[0-9a-f]{6}-general$/);
+
+    // 明確指定與既有相同的 entryId 時，加序號而非靜默覆蓋
+    const e5 = lib.recordExperience({
+      entryId: e1.entryId,
+      title: '衝突的 entryId',
+      summary: '應加序號',
+      sourceEventId: 'evt-005',
+      taskSequenceIndex: 5,
+    });
+    assert.equal(e5.entryId, `${e1.entryId}-2`);
+    assert.equal(JSON.parse(fs.readFileSync(path.join(tmp, e1.entryId, 'entry.meta.json'), 'utf8')).sourceEventId, 'evt-001');
+
+    // INDEX.md 依 taskSequenceIndex 排序（再依 createdAt），而非 entryId
+    const indexAfter = fs.readFileSync(path.join(tmp, 'INDEX.md'), 'utf8');
+    const order = [e1, e3, e4, e5].map((e) => indexAfter.indexOf(`| \`${e.entryId}\` |`));
+    assert.ok(order.every((i) => i >= 0));
+    assert.deepEqual([...order].sort((a, b) => a - b), order);
   } finally {
     fs.rmSync(tmp, { recursive: true, force: true });
   }

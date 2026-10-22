@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "递归 Harness",
+    "description": "用 Propose、Probe、Compose 循环和跨任务经验库，演进 agent 的系统提示词、护栏、工具指引、记忆与技能（Harness²，arXiv:2610.14224）。实验性。"
+  }
+}

@@ -1,0 +1,26 @@
+# dsh-plugin-recursive-harness bundle layer, applied when a profile lists this bundle.
+# To change a setting, patch row id `recursive-harness` in your profile's
+# cordis.patch.yml (for the web profile: ~/.dsh/profiles/web/cordis.patch.yml).
+# A patch replaces the whole `config`; keys you leave out fall back to the defaults below.
+#
+#   - id: recursive-harness
+#     config:
+#       enableRuntimeStagnation: true
+#
+- insert:
+    - id: recursive-harness
+      name: dsh-plugin-recursive-harness
+      config:
+        mode: full                   # full (service + /harness command) | apply-only (probe child processes only)
+        # baseDir: ~/.dsh/recursive-harness   # default: $DSH_HOME/recursive-harness; the three dirs below are relative to it
+        harnessDir: active           # the harness version mounted into every new Session
+        storageDir: state            # manifest, checkpoints, snapshots, session sidecars
+        experienceDir: experience    # cross-task experience library (INDEX.md + entries)
+        sectionOrder: 760            # system prompt section order of the mounted harness
+        maxConcurrency: 2            # parallel probe child processes (1-8)
+        maxTokensPerIteration: 120000
+        maxWallTimeMs: 300000
+        enableRuntimeStagnation: false   # stage 4 runtime stagnation detector (tools/post-execute)
+        stagnationThreshold: 3
+        lockedSurfaces: []           # extra paths a candidate may never touch (AGENTS.md is always locked)
+        protectedPatterns: []        # extra regex sources that reject a candidate when matched

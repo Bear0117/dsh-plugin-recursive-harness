@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Recursive Harness",
+    "description": "Evolves the agent's system prompt, guardrails, tool guidance, memory and skills with Propose, Probe, Compose loops and a cross-task experience library (Harness², arXiv:2610.14224). Experimental."
+  }
+}

@@ -1,0 +1,74 @@
+{
+  "name": "dsh-plugin-recursive-harness",
+  "version": "0.1.0",
+  "description": "Recursive Harness for DeepSeek Harness: evolves the agent's system prompt, guardrails, tool guidance, memory and skills with Propose, Probe, Compose loops and a cross-task experience library (Harness², arXiv:2610.14224). Experimental.",
+  "license": "MIT",
+  "author": "Bear0117 (https://github.com/Bear0117)",
+  "homepage": "https://github.com/Bear0117/dsh-plugin-recursive-harness#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Bear0117/dsh-plugin-recursive-harness.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Bear0117/dsh-plugin-recursive-harness/issues"
+  },
+  "type": "module",
+  "main": "./src/index.js",
+  "bin": {
+    "dsh-recursive-harness": "./src/cli.js"
+  },
+  "exports": {
+    ".": "./src/index.js",
+    "./cli": "./src/cli.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json",
+    "./locale/*.json": "./locale/*.json"
+  },
+  "files": [
+    "src",
+    "tasks",
+    "locale",
+    "cordis.patch.yml",
+    "README.zh-CN.md",
+    "README.zh-TW.md",
+    "CHANGELOG.md",
+    "docs/threat-model-and-dedup.md",
+    "docs/evaluation-report.md"
+  ],
+  "keywords": [
+    "dsh-plugin",
+    "deepseek-harness",
+    "harness",
+    "self-evolving",
+    "propose-probe-compose",
+    "experience-library",
+    "cordis"
+  ],
+  "engines": {
+    "node": "^22.19.0 || >=24.0.0",
+    "dsh": ">=0.2.0-rc.2 <0.3.0-0"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.js",
+    "m0:verify": "node m0/verify-seams.mjs",
+    "eval": "node eval/run-eval.mjs",
+    "harness": "node src/cli.js"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1",
+    "@deepseek-ai/dsh-tools": ">=0.2.0-rc.2 <0.3.0-0"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/cordis": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-tools": {
+      "optional": true
+    }
+  }
+}

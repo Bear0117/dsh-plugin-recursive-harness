@@ -89,10 +89,11 @@ export function normalizeProposerConfig(raw = {}) {
     allowHttpHosts: strList(raw.allowHttpHosts).map((h) => h.toLowerCase()),
     timeoutMs: num(raw.timeoutMs, 120000, { min: 1000, integer: true }),
     temperature: num(raw.temperature, 0.7, { min: 0, max: 2 }),
-    maxTokens: num(raw.maxTokens, 4000, { min: 256, integer: true }),
+    maxTokens: num(raw.maxTokens, 8000, { min: 256, integer: true }),
     extraBody: raw.extraBody && typeof raw.extraBody === 'object' ? raw.extraBody : {},
     maxCandidateChars: num(raw.maxCandidateChars, 6000, { min: 500, integer: true }),
     judge: Boolean(raw.judge),
+    jsonMode: Boolean(raw.jsonMode), // 送 response_format: json_object（vLLM、OpenAI 支援）
   };
 }
 

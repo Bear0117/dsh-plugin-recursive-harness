@@ -662,20 +662,25 @@ export class RecursiveHarnessCoordinator {
       }
 
       if (validProposals.length === 0) {
+        const why =
+          rawProposals.length === 0
+            ? '提案器沒有產生任何可用的候選（模型回覆無法解析或沒有改動）'
+            : `所有 ${rawProposals.length} 個候選提案皆因違反安全護欄而遭攔截`;
         if (!overallAdopted) {
           this.store.saveCheckpoint(runId, {
             state: EVOLUTION_STATES.REJECTED,
-            reason: '所有候選提案皆因違反安全護欄而遭攔截',
+            reason: why,
           });
         }
         stepHistory.push({
           step: stepIdx + 1,
           proposalsCount: 0,
           rejectedBySecurityCount: rejectedProposals.length,
+          rejectedProposals: rejectedProposals.map((r) => ({ proposalId: r.proposal.proposalId, violations: r.violations })),
           probeResults: [],
           adoptedInStep: false,
           chosenVersionId: currentHarness.versionId,
-          composedSummary: '所有候選提案皆因違反安全護欄而遭攔截',
+          composedSummary: why,
         });
         break;
       }

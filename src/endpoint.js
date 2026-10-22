@@ -158,6 +158,7 @@ export async function chatCompletion(settings, messages, options = {}) {
     text,
     usage: { inputTokens, outputTokens, totalTokens: Number(u.total_tokens) || inputTokens + outputTokens },
     model: json.model || settings.model,
+    finishReason: choice?.finish_reason ?? null,
   };
 }
 

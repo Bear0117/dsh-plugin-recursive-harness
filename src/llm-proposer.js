@@ -8,7 +8,7 @@ import { redactSensitiveText } from './security.js';
 const SKILL_NAME_RE = /^[a-z0-9][a-z0-9-]{0,63}$/;
 const SCRIPT_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 
-const PROPOSER_SYSTEM_PROMPT = `You improve the "harness" of a coding agent whose model weights are frozen (Harness², arXiv:2610.14224).
+export const PROPOSER_SYSTEM_PROMPT = `You improve the "harness" of a coding agent whose model weights are frozen (Harness², arXiv:2610.14224).
 The harness has four text components that are injected into the agent's system prompt, plus optional skills:
 - systemprompt: general working instructions
 - guardrails: things the agent must never do
@@ -253,12 +253,16 @@ export class LlmProposer {
           { role: 'system', content: PROPOSER_SYSTEM_PROMPT },
           { role: 'user', content: userPrompt },
         ],
-        { signal: context.signal, fetchImpl: this.fetchImpl, env: this.env },
+        { signal: context.signal, fetchImpl: this.fetchImpl, env: this.env, responseFormatJson: Boolean(this.settings.jsonMode) },
       );
       this._account(res.usage);
+      this.lastRawReply = res.text;
       const parsed = extractJsonObject(res.text);
       if (!parsed) {
-        this.log(`proposer: response ${k + 1} is not JSON, skipped`);
+        const excerpt = res.text.replace(/\s+/g, ' ').slice(0, 160);
+        this.log(
+          `proposer: response ${k + 1} is not JSON (finish=${res.finishReason ?? '?'}, ${res.usage.outputTokens} output tokens${res.finishReason === 'length' ? ', truncated: raise proposer.maxTokens' : ''}): ${excerpt}`,
+        );
         continue;
       }
       const limits = { maxCandidateChars: this.maxCandidateChars };

@@ -5,7 +5,13 @@
 #
 #   - id: recursive-harness
 #     config:
-#       enableRuntimeStagnation: true
+#       proposer:
+#         engine: llm
+#         endpoint: http://127.0.0.1:8000/v1/chat/completions
+#         model: my-model
+#       probe:
+#         provider: my-provider      # a provider id from your profile's llm-pi-ai rows
+#         model: my-model
 #
 - insert:
     - id: recursive-harness
@@ -18,9 +24,30 @@
         experienceDir: experience    # cross-task experience library (INDEX.md + entries)
         sectionOrder: 760            # system prompt section order of the mounted harness
         maxConcurrency: 2            # parallel probe child processes (1-8)
-        maxTokensPerIteration: 120000
-        maxWallTimeMs: 300000
+        maxTokensPerIteration: 120000   # token budget of one evolution run (all probes together)
+        maxWallTimeMs: 300000        # wall-clock budget of one evolution run
+        probeTimeoutMs: 600000       # one probe child process
         enableRuntimeStagnation: false   # stage 4 runtime stagnation detector (tools/post-execute)
         stagnationThreshold: 3
-        lockedSurfaces: []           # extra paths a candidate may never touch (AGENTS.md is always locked)
-        protectedPatterns: []        # extra regex sources that reject a candidate when matched
+        lockedSurfaces: []           # extra paths a candidate may never touch (AGENTS.md, .dsh, .git are always locked)
+        protectedPatterns: []        # extra regex sources that reject a candidate when matched (e.g. a production system name)
+        proposer:
+          engine: template           # template (fixed text, no model) | llm (OpenAI-compatible chat completions)
+          endpoint: http://127.0.0.1:8000/v1/chat/completions
+          model: ""                  # required for llm
+          apiKeyEnv: ""              # env var holding the key; empty when the endpoint needs none
+          allowEgress: false         # must be true before anything goes to a non-loopback endpoint
+          allowHttpHosts: []         # non-loopback hosts that may be reached over plain http
+          judge: false               # model judge as the third comparison tier (never overrides objective checks)
+          timeoutMs: 120000
+          temperature: 0.7
+          maxTokens: 4000
+          extraBody: {}              # merged into each request, e.g. { chat_template_kwargs: { enable_thinking: false } }
+          maxCandidateChars: 6000    # cap per harness component / skill body
+        probe:
+          templateProfile: web       # the profile whose model rows and credentials each probe child inherits
+          # templateDshHome: ~/.dsh  # default: $DSH_HOME
+          provider: ""               # override the probe child's default model (provider id from llm-pi-ai)
+          model: ""
+          # dshCliEntry: /path/to/@deepseek-ai/dsh/lib/bin.js   # auto-detected inside dsh; or env DSH_CLI_ENTRY
+          blockedTools: []           # tasks that require one of these tools are never probed automatically

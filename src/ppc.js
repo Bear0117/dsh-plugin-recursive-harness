@@ -537,6 +537,27 @@ export class RecursiveHarnessCoordinator {
    */
   async runPpcLoop(task, initialHarness, options = {}) {
     const runId = options.runId || `ppc-${task.taskId}-${Date.now()}`;
+    try {
+      return await this._runPpcLoopInner(task, initialHarness, { ...options, runId });
+    } catch (err) {
+      // 取消與預算耗盡已經各自寫了終止狀態；其他例外（端點連不上、子行程壞掉）標成 Failed，不要留在中間狀態
+      if (err?.code !== 'EVOLUTION_CANCELLED' && err?.code !== 'BUDGET_EXHAUSTED') {
+        try {
+          const cp = this.store.getCheckpoint(runId);
+          if (cp && !TERMINAL_STATES.has(cp.state)) {
+            this.store.saveCheckpoint(runId, { state: EVOLUTION_STATES.FAILED, reason: String(err?.message || err) });
+          }
+        } catch {
+          // 狀態寫不進去也不要蓋掉原本的錯誤
+        }
+      }
+      this.activeProbes.delete(runId);
+      throw err;
+    }
+  }
+
+  async _runPpcLoopInner(task, initialHarness, options) {
+    const runId = options.runId;
     const referenceRunsCount = Math.max(1, Number(options.referenceRunsCount ?? 2) || 1);
     const kPerAxis = options.kPerAxis ?? 1;
     const sequentialSteps = options.sequentialSteps ?? 1;

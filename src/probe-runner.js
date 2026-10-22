@@ -231,6 +231,8 @@ export class ProbeRunner {
    */
   prepareIsolatedEnvironment(runId, task, harnessVersion) {
     const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), TEMP_PREFIX));
+    // 立刻登記，之後任何一步失敗（安全檢查、路徑穿越）cleanup 都找得到它
+    this.tempRoots.set(runId, tempRoot);
     const dshHome = path.join(tempRoot, 'h');
     const workspaceDir = path.join(tempRoot, 'w');
     const harnessDir = path.join(dshHome, 'harness');
@@ -317,7 +319,6 @@ export class ProbeRunner {
       }
     }
 
-    this.tempRoots.set(runId, tempRoot);
     return { tempRoot, dshHome, workspaceDir, harnessDir, profileDir, patchFiles };
   }
 

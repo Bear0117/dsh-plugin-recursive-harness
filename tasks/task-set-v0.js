@@ -55,7 +55,7 @@ export const TASK_SET_V0 = [
     executionMode: 'Standard-Sandbox',
     title: '服務路由設定正規化與加總不變量驗算',
     prompt:
-      '請讀取工作區中的 legacy-services.json，將啟用中（enabled: true）的服務依 port 由小到大排序，輸出包含 totalServices, enabledCount, disabledCount, routes 陣列與 portSum 的 JSON 報告。',
+      '請讀取工作區中的 legacy-services.json。只取 enabled 為 true 的服務，依 port 由小到大排序。輸出一個 JSON 物件，欄位：totalServices（所有服務數，含停用）、enabledCount（啟用服務數）、disabledCount（停用服務數）、routes（字串陣列，每個元素是 "path:port"，例如 "/v1/auth:8082"，依 port 由小到大排列）、portSum（啟用服務的 port 總和）。最後只輸出這個 JSON。',
     workspaceFiles: {
       'legacy-services.json': JSON.stringify(
         {
@@ -119,7 +119,7 @@ export const TASK_SET_V0 = [
     executionMode: 'Standard-Sandbox',
     title: '伺服器日誌異常分群與錯誤率精確計算',
     prompt:
-      '請分析工作區 server.log，排除 /healthz 健康檢查紀錄後，計算有效請求數 validRequests、錯誤數 errorCount、依錯誤碼分組之 errorCountsByCode，以及錯誤率百分比 errorRatePct（四捨五入至小數點後兩位）。',
+      '請分析工作區 server.log，每行格式是「時間 方法 路徑 狀態碼 訊息」。先排除路徑為 /healthz 的健康檢查紀錄，再以剩下的紀錄計算並輸出一個 JSON 物件：validRequests（排除後的紀錄數）、errorCount（狀態碼 500 以上的紀錄數）、errorCountsByCode（物件，鍵是錯誤紀錄最後一欄的錯誤碼例如 ERR_DB_LOCK，值是次數）、errorRatePct（errorCount ÷ validRequests × 100，四捨五入到小數點後兩位的數字，例如 50 或 33.33）。最後只輸出這個 JSON。',
     workspaceFiles: {
       'server.log': [
         '2026-10-01T10:00:01Z GET /healthz 200 OK',
@@ -186,7 +186,7 @@ export const TASK_SET_V0 = [
     executionMode: 'Standard-Sandbox',
     title: '套件相依拓撲排序與循環相依檢測',
     prompt:
-      '請讀取 packages-dag.json，驗證是否存在循環相依（hasCycle），並輸出字典序穩定之拓撲建置順序 buildOrder 與葉節點清單 leafPackages。',
+      '請讀取 packages-dag.json：packages 物件的鍵是套件名，值是它依賴的套件清單。輸出一個 JSON 物件：hasCycle（布林，是否存在循環相依）、leafPackages（沒有任何依賴的套件名，依字母序排列的字串陣列）、buildOrder（字串陣列，拓撲建置順序：每一輪從「所有依賴都已排入」的套件中選字母序最小的一個排入，重複到排完；若有循環則給空陣列）。最後只輸出這個 JSON。',
     workspaceFiles: {
       'packages-dag.json': JSON.stringify(
         {
@@ -678,7 +678,7 @@ export const TASK_SET_V0 = [
     executionMode: 'Standard-Sandbox',
     title: '發行產物清單雜湊稽核與位元組總計驗算',
     prompt:
-      '請讀取 release-manifest.json，核對各檔案 expectedSha256 與 actualSha256，輸出 totalFiles, verifiedCount, corruptedFiles（依檔名排序）與 verifiedTotalBytes。',
+      '請讀取 release-manifest.json，對 files 裡每個檔案比對 expectedSha256 與 actualSha256。輸出一個 JSON 物件：totalFiles（檔案總數）、verifiedCount（兩者相同的檔案數）、corruptedFiles（不相同的檔案 name，依字母序排列的字串陣列）、verifiedTotalBytes（只加總驗證相同的檔案的 bytes）。最後只輸出這個 JSON。',
     workspaceFiles: {
       'release-manifest.json': JSON.stringify(
         {
@@ -740,7 +740,7 @@ export const TASK_SET_V0 = [
     executionMode: 'Standard-Sandbox',
     title: 'API 契約相容性比對與破壞性變更統計',
     prompt:
-      '請比對工作區 api-schema-diff.json 中之 v1 與 v2 欄位定義，輸出 totalFieldsCompared, breakingCount, breakingFields（依欄位名排序）與 isBackwardCompatible。',
+      '請讀取 api-schema-diff.json，fields 裡每個欄位有 name、v1Type、v2Type（null 代表 v2 已移除）、v1Required、v2Required。破壞性變更的定義：v2Type 與 v1Type 不同（包含被移除），或 v1Required 為 false 而 v2Required 為 true。輸出一個 JSON 物件：totalFieldsCompared（欄位總數）、breakingCount（破壞性欄位數）、breakingFields（破壞性欄位的 name，依字母序排列的字串陣列）、isBackwardCompatible（breakingCount 為 0 時 true，否則 false）。最後只輸出這個 JSON。',
     workspaceFiles: {
       'api-schema-diff.json': JSON.stringify(
         {
